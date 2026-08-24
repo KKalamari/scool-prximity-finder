@@ -4,6 +4,321 @@
 import re
 import time
 import difflib
+import unicodedata
+
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+import folium
+
+# ---------------------------------------------------------------------
+geolocator = Nominatim(user_agent="teacher-closest-school-finder-webapp (contact: example@example.com)")
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+ATTICA_BBOX = (37.75, 23.45, 38.25, 24.05)  # south, west, north, east
+
+# Γενικές λέξεις που αγνοούνται όταν συγκρίνουμε ονόματα σχολείων
+# (π.χ. "32ο σχολείο Αθηνών" vs επίσημο OSM "32ο Δημοτικό Σχολείο Αθηνών")
+GENERIC_WORDS = {
+    "σχολειο", "σχολειου", "σχολειων", "δημοτικο", "δημοτικου", "δημ",
+    "δ.σ", "δσ", "νηπιαγωγειο", "νηπιαγωγειου", "νηπ", "ν/γ", "νγ",
+    "ολοημερο", "ολοημερου", "ειδικο", "ειδικης", "αγωγης", "πρωτυπο",
+    "πειραματικο", "τμημα", "ενταξης", "της", "του", "και",
+}
+
+
+def strip_accents(text):
+    """Αφαιρεί τόνους (π.χ. 'ά'->'α') κρατώντας το ελληνικό αλφάβητο, ώστε
+    οι συγκρίσεις να μη χαλάνε από τόνους που λείπουν ή διαφέρουν."""
+    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
+
+
+def norm(text):
+    """Πεζά + χωρίς τόνους + χωρίς διπλά κενά, για ασφαλείς συγκρίσεις κειμένου."""
+    return re.sub(r"\s+", " ", strip_accents(text).strip()).lower()
+
+
+def extract_number_and_rest(name):
+    """Από '32ο Δημοτικό Σχολείο Αθηνών' -> ('32', 'Δημοτικό Σχολείο Αθηνών')."""
+    m = re.match(r"\s*(\d+)\s*[οΟ][ςΣ']?\s*(.*)$", name)
+    if m:
+        return m.group(1), m.group(2).strip()
+    return None, name
+
+
+def geocode_photon(address, tries=2):
+    """Εναλλακτικός geocoder (Komoot Photon, βασισμένος σε OSM δεδομένα, χωρίς κλειδί).
+    Δεν ανήκει στο OpenStreetMap Foundation, οπότε δεν επηρεάζεται από τα μπλοκ IP
+    που εφαρμόζει το nominatim.openstreetmap.org σε πολλά cloud hosting (π.χ. Streamlit Cloud)."""
+    errors = []
+    for _ in range(tries):
+        try:
+            r = requests.get(
+                "https://photon.komoot.io/api/",
+                params={"q": address, "limit": 1, "lang": "en"},
+                headers={"User-Agent": "teacher-closest-school-finder-webapp"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            feats = r.json().get("features", [])
+            if feats:
+                lon, lat = feats[0]["geometry"]["coordinates"]
+                return (lat, lon), errors
+            errors.append("Photon: καμία αντιστοίχιση")
+            break
+        except Exception as e:
+            errors.append(f"Photon: {e}")
+            time.sleep(1)
+    return None, errors
+
+
+def geocode_nominatim(addr, tries=3):
+    errors = []
+    for _ in range(tries):
+        try:
+            loc = geolocator.geocode(addr, timeout=10)
+            if loc:
+                return (loc.latitude, loc.longitude), errors
+            errors.append("Nominatim: καμία αντιστοίχιση")
+            break
+        except Exception as e:
+            errors.append(f"Nominatim: {e}")
+            time.sleep(1)
+    return None, errors
+
+
+def geocode_address(address, tries=3):
+    """Δοκιμάζει πρώτα Photon και μετά Nominatim. Επιστρέφει (coords, debug_errors)."""
+    addr = address.strip()
+    if not re.search(r"ελλ[αά]δα|greece", addr, re.IGNORECASE):
+        addr = addr + ", Ελλάδα"
+
+    coords, err1 = geocode_photon(addr, tries=2)
+    if coords:
+        return coords, []
+
+    coords, err2 = geocode_nominatim(addr, tries=tries)
+    if coords:
+        return coords, []
+
+    return None, err1 + err2
+
+
+def clean_school_name(raw_line):
+    line = raw_line.strip()
+    line = re.sub(r"\(.*?\)", "", line)
+    line = re.sub(r"^\d+[\.\)]\s*", "", line)
+    line = re.sub(r"\s{2,}", " ", line).strip()
+    return line
+
+
+def looks_like_school_line(line):
+    keywords = ["ΔΗΜΟΤΙΚ", "ΝΗΠΙΑΓΩΓ", "ΣΧΟΛΕΙ", "Δ.Σ", "Ν/Γ", "ΟΛΟΗΜΕΡ"]
+    upper = line.upper()
+    return any(k in upper for k in keywords)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def query_overpass(name):
+    s, w, n, e = ATTICA_BBOX
+    number, _rest = extract_number_and_rest(name)
+    if number:
+        # Ψάχνει ό,τι ΞΕΚΙΝΑΕΙ με τον ίδιο αριθμό (π.χ. "32ο ..."). Δεν εξαρτάται
+        # από τόνους ή λέξεις όπως "Δημοτικό/Σχολείο" που μπορεί να λείπουν.
+        name_regex = rf"^\s*{number}\s*[οΟ]"
+    else:
+        name_regex = re.escape(name)
+    query = f"""
+    [out:json][timeout:25];
+    (
+      node["amenity"~"school|kindergarten"]["name"~"{name_regex}",i]({s},{w},{n},{e});
+      way["amenity"~"school|kindergarten"]["name"~"{name_regex}",i]({s},{w},{n},{e});
+      relation["amenity"~"school|kindergarten"]["name"~"{name_regex}",i]({s},{w},{n},{e});
+    );
+    out center tags;
+    """
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
+        r.raise_for_status()
+        return r.json().get("elements", [])
+    except Exception:
+        return []
+
+
+def best_match(name, elements):
+    target = norm(name)
+    best, best_score = None, 0.0
+    for el in elements:
+        cand_name = el.get("tags", {}).get("name", "")
+        score = difflib.SequenceMatcher(None, target, norm(cand_name)).ratio()
+        if score > best_score:
+            best_score, best = score, el
+    return best, best_score
+
+
+def get_coords(el):
+    if "lat" in el and "lon" in el:
+        return el["lat"], el["lon"]
+    center = el.get("center")
+    if center:
+        return center["lat"], center["lon"]
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def locate_school(name):
+    elements = query_overpass(name)
+    if elements:
+        el, score = best_match(name, elements)
+        if el and score > 0.30:
+            coords = get_coords(el)
+            if coords:
+                tags = el.get("tags", {})
+                addr_parts = [tags.get("addr:street", ""), tags.get("addr:housenumber", ""), tags.get("addr:city", "")]
+                address = " ".join(p for p in addr_parts if p).strip()
+                if not address:
+                    address = "Διεύθυνση μη διαθέσιμη στο OpenStreetMap"
+                matched_name = tags.get("name", name)
+                return coords[0], coords[1], address, "OpenStreetMap", matched_name
+
+    for attempt_query in (f"{name}, Αθήνα, Ελλάδα", f"{name}, Αττική, Ελλάδα"):
+        coords, _ = geocode_photon(attempt_query, tries=1)
+        if coords:
+            return coords[0], coords[1], "Άγνωστη ακριβής διεύθυνση (βρέθηκε κατά προσέγγιση)", "Photon (κατά προσέγγιση)", name
+        try:
+            loc = geolocator.geocode(attempt_query, timeout=10)
+            if loc:
+                return loc.latitude, loc.longitude, loc.address, "Nominatim (κατά προσέγγιση)", name
+        except Exception:
+            time.sleep(1)
+    return None
+
+
+# =======================================================================
+# UI
+# =======================================================================
+st.set_page_config(page_title="Πλησιέστερο Σχολείο", page_icon="🏫", layout="wide")
+st.title("🏫 Εύρεση πλησιέστερου σχολείου")
+st.caption("Πρωτοβάθμια Εκπαίδευση (Δημοτικά/Νηπιαγωγεία) - Αθήνα")
+
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    home_address = st.text_input(
+        "Διεύθυνση κατοικίας σου",
+        placeholder="π.χ. Πατησίων 100, Αθήνα",
+    )
+
+with col2:
+    schools_raw = st.text_area(
+        "Λίστα σχολείων (ένα σχολείο ανά γραμμή)",
+        height=150,
+        placeholder="25ο Δημοτικό Σχολείο Αθηνών\n3ο Νηπιαγωγείο Νέας Φιλαδέλφειας\n1ο Δημοτικό Σχολείο Ψυχικού",
+    )
+
+run = st.button("🔎 Βρες αποστάσεις & χάρτη", type="primary")
+
+if run:
+    if not home_address.strip():
+        st.error("Συμπλήρωσε πρώτα τη διεύθυνση κατοικίας σου.")
+        st.stop()
+    if not schools_raw.strip():
+        st.error("Επικόλλησε τη λίστα σχολείων.")
+        st.stop()
+
+    with st.spinner("Εντοπισμός διεύθυνσης κατοικίας..."):
+        home_coords, geocode_errors = geocode_address(home_address)
+
+    if not home_coords:
+        st.error(
+            "Δεν μπόρεσα να εντοπίσω αυτή τη διεύθυνση. Δοκίμασε πιο συγκεκριμένη μορφή "
+            "(οδός, αριθμός, περιοχή)."
+        )
+        if geocode_errors:
+            with st.expander("Τεχνικές λεπτομέρειες (για αν χρειαστεί υποστήριξη)"):
+                for e in geocode_errors:
+                    st.code(e)
+        st.stop()
+
+    st.success(f"Το σπίτι εντοπίστηκε στις συντεταγμένες: {home_coords}")
+
+    raw_lines = [l for l in schools_raw.splitlines() if l.strip()]
+    school_names = []
+    for line in raw_lines:
+        cleaned = clean_school_name(line)
+        if cleaned and looks_like_school_line(cleaned):
+            school_names.append(cleaned)
+    school_names = list(dict.fromkeys(school_names))
+
+    if not school_names:
+        st.warning("Δεν αναγνωρίστηκε κανένα όνομα σχολείου στη λίστα.")
+        st.stop()
+
+    st.write(f"Βρέθηκαν **{len(school_names)}** πιθανά σχολεία. Αναζήτηση σε εξέλιξη...")
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    results = []
+    not_found = []
+    for i, name in enumerate(school_names):
+        status.write(f"Αναζήτηση: {name}")
+        found = locate_school(name)
+        if found:
+            lat, lon, address, method, matched_name = found
+            dist_km = geodesic(home_coords, (lat, lon)).km
+            results.append({
+                "Έγραψες": name,
+                "Βρέθηκε ως": matched_name,
+                "Απόσταση (χλμ)": round(dist_km, 2),
+                "Διεύθυνση": address, "Πηγή": method,
+                "_lat": lat, "_lon": lon,
+            })
+        else:
+            not_found.append(name)
+        progress.progress((i + 1) / len(school_names))
+        time.sleep(0.3)
+
+    status.empty()
+    progress.empty()
+    results.sort(key=lambda r: r["Απόσταση (χλμ)"])
+
+    st.subheader("Αποτελέσματα (ταξινομημένα κατά απόσταση)")
+    st.dataframe(
+        [{k: v for k, v in r.items() if not k.startswith("_")} for r in results],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not_found:
+        with st.expander(f"⚠ {len(not_found)} σχολεία δεν βρέθηκαν αυτόματα"):
+            for n in not_found:
+                st.write(f"- {n}")
+
+    st.subheader("Διαδραστικός χάρτης")
+    m = folium.Map(location=home_coords, zoom_start=12)
+    folium.Marker(
+        home_coords, popup="Το σπίτι μου", tooltip="Σπίτι",
+        icon=folium.Icon(color="red", icon="home", prefix="fa"),
+    ).add_to(m)
+    for r in results:
+        folium.Marker(
+            [r["_lat"], r["_lon"]],
+            popup=folium.Popup(
+                f"<b>{r['Βρέθηκε ως']}</b><br>{r['Απόσταση (χλμ)']} χλμ<br>{r['Διεύθυνση']}",
+                max_width=300,
+            ),
+            tooltip=f"{r['Βρέθηκε ως']} ({r['Απόσταση (χλμ)']} χλμ)",
+            icon=folium.Icon(color="blue", icon="graduation-cap", prefix="fa"),
+        ).add_to(m)
+    components.html(m._repr_html_(), height=520, scrolling=True)
+else:
+    st.info("Συμπλήρωσε τη διεύθυνση και τη λίστα σχολείων, μετά πάτα το κουμπί.")# =====================================================================
+# ΕΥΡΕΣΗ ΠΛΗΣΙΕΣΤΕΡΟΥ ΣΧΟΛΕΙΟΥ - Web εφαρμογή (Streamlit)
+# =====================================================================
+import re
+import time
+import difflib
 
 import requests
 import streamlit as st
