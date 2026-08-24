@@ -22,19 +22,62 @@ def normalize(text):
     return re.sub(r"\s+", " ", text.strip()).lower()
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def geocode_address(address, tries=3):
-    addr = address.strip()
-    if not re.search(r"ελλ[αά]δα|greece", addr, re.IGNORECASE):
-        addr = addr + ", Ελλάδα"
+def geocode_photon(address, tries=2):
+    """Εναλλακτικός geocoder (Komoot Photon, βασισμένος σε OSM δεδομένα, χωρίς κλειδί).
+    Δεν ανήκει στο OpenStreetMap Foundation, οπότε δεν επηρεάζεται από τα μπλοκ IP
+    που εφαρμόζει το nominatim.openstreetmap.org σε πολλά cloud hosting (π.χ. Streamlit Cloud)."""
+    errors = []
+    for _ in range(tries):
+        try:
+            r = requests.get(
+                "https://photon.komoot.io/api/",
+                params={"q": address, "limit": 1, "lang": "en"},
+                headers={"User-Agent": "teacher-closest-school-finder-webapp"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            feats = r.json().get("features", [])
+            if feats:
+                lon, lat = feats[0]["geometry"]["coordinates"]
+                return (lat, lon), errors
+            errors.append("Photon: καμία αντιστοίχιση")
+            break
+        except Exception as e:
+            errors.append(f"Photon: {e}")
+            time.sleep(1)
+    return None, errors
+
+
+def geocode_nominatim(addr, tries=3):
+    errors = []
     for _ in range(tries):
         try:
             loc = geolocator.geocode(addr, timeout=10)
             if loc:
-                return (loc.latitude, loc.longitude)
-        except Exception:
+                return (loc.latitude, loc.longitude), errors
+            errors.append("Nominatim: καμία αντιστοίχιση")
+            break
+        except Exception as e:
+            errors.append(f"Nominatim: {e}")
             time.sleep(1)
-    return None
+    return None, errors
+
+
+def geocode_address(address, tries=3):
+    """Δοκιμάζει πρώτα Photon και μετά Nominatim. Επιστρέφει (coords, debug_errors)."""
+    addr = address.strip()
+    if not re.search(r"ελλ[αά]δα|greece", addr, re.IGNORECASE):
+        addr = addr + ", Ελλάδα"
+
+    coords, err1 = geocode_photon(addr, tries=2)
+    if coords:
+        return coords, []
+
+    coords, err2 = geocode_nominatim(addr, tries=tries)
+    if coords:
+        return coords, []
+
+    return None, err1 + err2
 
 
 def clean_school_name(raw_line):
@@ -108,13 +151,15 @@ def locate_school(name):
                 return coords[0], coords[1], address, "OpenStreetMap"
 
     for attempt_query in (f"{name}, Αθήνα, Ελλάδα", f"{name}, Αττική, Ελλάδα"):
-        for _ in range(2):
-            try:
-                loc = geolocator.geocode(attempt_query, timeout=10)
-                if loc:
-                    return loc.latitude, loc.longitude, loc.address, "Nominatim (κατά προσέγγιση)"
-            except Exception:
-                time.sleep(1)
+        coords, _ = geocode_photon(attempt_query, tries=1)
+        if coords:
+            return coords[0], coords[1], "Άγνωστη ακριβής διεύθυνση (βρέθηκε κατά προσέγγιση)", "Photon (κατά προσέγγιση)"
+        try:
+            loc = geolocator.geocode(attempt_query, timeout=10)
+            if loc:
+                return loc.latitude, loc.longitude, loc.address, "Nominatim (κατά προσέγγιση)"
+        except Exception:
+            time.sleep(1)
     return None
 
 
@@ -151,13 +196,17 @@ if run:
         st.stop()
 
     with st.spinner("Εντοπισμός διεύθυνσης κατοικίας..."):
-        home_coords = geocode_address(home_address)
+        home_coords, geocode_errors = geocode_address(home_address)
 
     if not home_coords:
         st.error(
             "Δεν μπόρεσα να εντοπίσω αυτή τη διεύθυνση. Δοκίμασε πιο συγκεκριμένη μορφή "
             "(οδός, αριθμός, περιοχή)."
         )
+        if geocode_errors:
+            with st.expander("Τεχνικές λεπτομέρειες (για αν χρειαστεί υποστήριξη)"):
+                for e in geocode_errors:
+                    st.code(e)
         st.stop()
 
     st.success(f"Το σπίτι εντοπίστηκε στις συντεταγμένες: {home_coords}")
