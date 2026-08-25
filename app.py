@@ -8,6 +8,7 @@ import json
 import time
 import difflib
 import unicodedata
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -373,9 +374,23 @@ if run:
 
         home_lat, home_lon = home_coords
         sch_lat, sch_lon = school_coords
+
+        # Για τα links του Google Maps προτιμάμε να στέλνουμε ΚΕΙΜΕΝΟ διεύθυνσης
+        # αντί για lat/lon: το ίδιο το Google κάνει το δικό του (συνήθως πιο
+        # ακριβές) geocoding, αντί να εμπιστευόμαστε τις δικές μας συντεταγμένες.
+        origin_text = home_address.strip()
+        if not re.search(r"ελλ[αά]δα|greece", origin_text, re.IGNORECASE):
+            origin_text += ", Ελλάδα"
+        origin_param = quote(origin_text)
+
+        if r["Διεύθυνση"] and "Άγνωστη" not in r["Διεύθυνση"]:
+            dest_param = quote(f"{r['Διεύθυνση']}, Ελλάδα")
+        else:
+            dest_param = f"{sch_lat},{sch_lon}"
+
         directions_driving = (
-            f"https://www.google.com/maps/dir/?api=1&origin={home_lat},{home_lon}"
-            f"&destination={sch_lat},{sch_lon}&travelmode=driving"
+            f"https://www.google.com/maps/dir/?api=1&origin={origin_param}"
+            f"&destination={dest_param}&travelmode=driving"
         )
         directions_walking = directions_driving.replace("travelmode=driving", "travelmode=walking")
         directions_transit = directions_driving.replace("travelmode=driving", "travelmode=transit")
