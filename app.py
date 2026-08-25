@@ -201,6 +201,14 @@ def get_osm_coords(el):
     return None
 
 
+def _in_attica(lat, lon):
+    """Ελέγχει ότι ένα σημείο βρίσκεται όντως μέσα στην ευρύτερη Αττική.
+    Χρησιμοποιείται σαν δικλείδα ασφαλείας: αν το geocoding επιστρέψει κάτι
+    εκτός αυτού του πλαισίου, κάτι πήγε στραβά και το απορρίπτουμε."""
+    s, w, n, e = ATTICA_BBOX
+    return s <= lat <= n and w <= lon <= e
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def locate_school(name):
     """Επιστρέφει (lat, lon, address, method, matched_name) ή None.
@@ -212,11 +220,11 @@ def locate_school(name):
     # 1) Επίσημη βάση
     entry, score = find_in_database(name)
     if entry and score > 0.40:
-        full_address = f"{entry['street']}, {entry['postcode']} {entry['area']}, Αθήνα, Ελλάδα"
+        full_address = f"{entry['street']}, {entry['postcode']} {entry['area']}, Ελλάδα"
         coords, _ = geocode_address(full_address)
-        if coords:
+        if coords and _in_attica(*coords):
             display_address = f"{entry['street']}, {entry['postcode']} {entry['area']}"
-            return coords[0], coords[1], display_address, "Επίσημη λίστα Α' Αθήνας 2024-25", entry["name"]
+            return coords[0], coords[1], display_address, "Επίσημη λίστα (Α'/Β' Αθήνας)", entry["name"]
 
     # 2) OpenStreetMap POI αναζήτηση (π.χ. σχολεία εκτός Α' Αθήνας)
     elements = query_overpass(name)
@@ -236,11 +244,11 @@ def locate_school(name):
     # 3) Έσχατη λύση: αναζήτηση ονόματος ως τοποθεσία
     for attempt_query in (f"{name}, Αθήνα, Ελλάδα", f"{name}, Αττική, Ελλάδα"):
         coords, _ = geocode_photon(attempt_query, tries=1)
-        if coords:
+        if coords and _in_attica(*coords):
             return coords[0], coords[1], "Άγνωστη ακριβής διεύθυνση (κατά προσέγγιση)", "Photon (κατά προσέγγιση)", name
         try:
             loc = geolocator.geocode(attempt_query, timeout=10)
-            if loc:
+            if loc and _in_attica(loc.latitude, loc.longitude):
                 return loc.latitude, loc.longitude, loc.address, "Nominatim (κατά προσέγγιση)", name
         except Exception:
             time.sleep(1)
