@@ -349,20 +349,43 @@ if run:
                 st.write(f"- {n}")
 
     st.subheader("Διαδραστικός χάρτης")
-    st.caption("Εμφανίζονται μόνο τα σχολεία της λίστας που επικόλλησες παραπάνω.")
+    st.caption("Εμφανίζονται μόνο τα σχολεία της λίστας που επικόλλησες παραπάνω. Πάτα σε ένα σχολείο για δρομολόγιο από το σπίτι.")
     m = folium.Map(location=home_coords, zoom_start=12)
     folium.Marker(
         home_coords, popup="Το σπίτι μου", tooltip="Σπίτι",
         icon=folium.Icon(color="red", icon="home", prefix="fa"),
     ).add_to(m)
     for r in results:
+        school_coords = (r["_lat"], r["_lon"])
+        # Διακεκομμένη γραμμή σπίτι -> σχολείο (ευθεία, οπτική ένδειξη - όχι πραγματική διαδρομή)
+        folium.PolyLine(
+            [home_coords, school_coords],
+            color="#4a90d9", weight=2, opacity=0.6, dash_array="6,6",
+        ).add_to(m)
+
+        home_lat, home_lon = home_coords
+        sch_lat, sch_lon = school_coords
+        directions_driving = (
+            f"https://www.google.com/maps/dir/?api=1&origin={home_lat},{home_lon}"
+            f"&destination={sch_lat},{sch_lon}&travelmode=driving"
+        )
+        directions_walking = directions_driving.replace("travelmode=driving", "travelmode=walking")
+        directions_transit = directions_driving.replace("travelmode=driving", "travelmode=transit")
+
+        popup_html = f"""
+        <div style="font-family: sans-serif; min-width: 220px;">
+          <b>{r['Βρέθηκε ως']}</b><br>
+          {r['Απόσταση (χλμ)']} χλμ από το σπίτι (ευθεία)<br>
+          {r['Διεύθυνση']}<br><br>
+          <a href="{directions_driving}" target="_blank">🚗 Οδηγίες (αυτοκίνητο)</a><br>
+          <a href="{directions_walking}" target="_blank">🚶 Οδηγίες (περπάτημα)</a><br>
+          <a href="{directions_transit}" target="_blank">🚌 Οδηγίες (Μ.Μ.Μ.)</a>
+        </div>
+        """
         folium.Marker(
             [r["_lat"], r["_lon"]],
-            popup=folium.Popup(
-                f"<b>{r['Βρέθηκε ως']}</b><br>{r['Απόσταση (χλμ)']} χλμ<br>{r['Διεύθυνση']}",
-                max_width=300,
-            ),
-            tooltip=f"{r['Βρέθηκε ως']} ({r['Απόσταση (χλμ)']} χλμ)",
+            popup=folium.Popup(popup_html, max_width=280),
+            tooltip=f"{r['Βρέθηκε ως']} ({r['Απόσταση (χλμ)']} χλμ) - πάτα για δρομολόγιο",
             icon=folium.Icon(color="blue", icon="graduation-cap", prefix="fa"),
         ).add_to(m)
     components.html(m._repr_html_(), height=520, scrolling=True)
