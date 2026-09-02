@@ -156,7 +156,10 @@ def clean_school_name(raw_line):
 
 
 def looks_like_school_line(line):
-    keywords = ["ΔΗΜΟΤΙΚ", "ΝΗΠΙΑΓΩΓ", "ΣΧΟΛΕΙ", "Δ.Σ", "Ν/Γ", "ΟΛΟΗΜΕΡ", "ΕΙΔΙΚΟ", "ΕΛΕΠΑΠ"]
+    keywords = [
+        "ΔΗΜ", "ΝΗΠ", "ΣΧΟΛΕΙ", "Δ.Σ", "Ν/Γ",
+        "ΟΛΟΗΜΕΡ", "ΕΙΔΙΚΟ", "ΕΛΕΠΑΠ",
+    ]
     upper = line.upper()
     return any(k in upper for k in keywords)
 
