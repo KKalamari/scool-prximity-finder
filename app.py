@@ -219,6 +219,44 @@ def _in_attica(lat, lon):
     return s <= lat <= n and w <= lon <= e
 
 
+def build_address_candidates(entry):
+    """Φτιάχνει μια λίστα εναλλακτικών διευθύνσεων προς δοκιμή, από την πιο
+    ακριβή στην πιο γενική - χρήσιμο όταν η πλήρης διεύθυνση (π.χ. με 'ΟΔΟΣ
+    & ΟΔΟΣ' σε γωνία δύο δρόμων) μπερδεύει τον geocoder."""
+    street = entry.get("street", "").strip()
+    postcode = entry.get("postcode", "").strip()
+    area = entry.get("area", "").strip()
+    postcode_part = f"{postcode} " if postcode else ""
+
+    candidates = []
+    if street:
+        candidates.append(f"{street}, {postcode_part}{area}, Ελλάδα")
+        # Αν είναι γωνία δύο δρόμων ("Χ & Ψ"), δοκίμασε μόνο τον πρώτο δρόμο
+        if "&" in street:
+            first_street = street.split("&")[0].strip()
+            if first_street:
+                candidates.append(f"{first_street}, {postcode_part}{area}, Ελλάδα")
+        # Χωρίς Τ.Κ.
+        if postcode:
+            candidates.append(f"{street}, {area}, Ελλάδα")
+    # Μόνο Τ.Κ. + περιοχή (πιο γενικό, αλλά πάντα μέσα στη σωστή γειτονιά)
+    if postcode:
+        candidates.append(f"{postcode} {area}, Ελλάδα")
+    if area:
+        candidates.append(f"{area}, Ελλάδα")
+    return candidates
+
+
+def geocode_db_entry(entry):
+    """Δοκιμάζει διαδοχικά τις εναλλακτικές διευθύνσεις μέχρι να πετύχει μία
+    μέσα στα όρια της Αττικής. Επιστρέφει (coords, address_used) ή (None, None)."""
+    for addr in build_address_candidates(entry):
+        coords, _ = geocode_address(addr)
+        if coords and _in_attica(*coords):
+            return coords, addr
+    return None, None
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def locate_school(name):
     """Επιστρέφει (lat, lon, address, method, matched_name) ή None.
@@ -230,10 +268,9 @@ def locate_school(name):
     # 1) Επίσημη βάση
     entry, score = find_in_database(name)
     if entry and score > 0.40:
-        postcode_part = f"{entry['postcode']} " if entry.get("postcode") else ""
-        full_address = f"{entry['street']}, {postcode_part}{entry['area']}, Ελλάδα"
-        coords, _ = geocode_address(full_address)
-        if coords and _in_attica(*coords):
+        coords, addr_used = geocode_db_entry(entry)
+        if coords:
+            postcode_part = f"{entry['postcode']} " if entry.get("postcode") else ""
             display_address = f"{entry['street']}, {postcode_part}{entry['area']}".strip()
             return coords[0], coords[1], display_address, "Επίσημη λίστα (Α'/Β'/Δ' Αθήνας)", entry["name"]
 
